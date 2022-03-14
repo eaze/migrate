@@ -6,11 +6,14 @@ import (
 	sqldriver "database/sql/driver"
 	"fmt"
 	"log"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/dhui/dktest"
+	"github.com/docker/go-connections/nat"
 	"github.com/golang-migrate/migrate/v4"
 
 	dt "github.com/golang-migrate/migrate/v4/database/testing"
@@ -23,14 +26,27 @@ const defaultPort = 1433
 const saPassword = "Root1234"
 
 var (
-	opts = dktest.Options{
+	sqlEdgeOpts = dktest.Options{
+		Env: map[string]string{"ACCEPT_EULA": "Y", "MSSQL_SA_PASSWORD": saPassword},
+		PortBindings: map[nat.Port][]nat.PortBinding{
+			nat.Port(fmt.Sprintf("%d/tcp", defaultPort)): {
+				nat.PortBinding{
+					HostIP:   "0.0.0.0",
+					HostPort: fmt.Sprintf("%d/tcp", defaultPort),
+				},
+			},
+		},
+		PortRequired: true, ReadyFunc: isReady, PullTimeout: 2 * time.Minute,
+	}
+	sqlServerOpts = dktest.Options{
 		Env:          map[string]string{"ACCEPT_EULA": "Y", "SA_PASSWORD": saPassword, "MSSQL_PID": "Express"},
 		PortRequired: true, ReadyFunc: isReady, PullTimeout: 2 * time.Minute,
 	}
 	// Container versions: https://mcr.microsoft.com/v2/mssql/server/tags/list
 	specs = []dktesting.ContainerSpec{
-		{ImageName: "mcr.microsoft.com/mssql/server:2017-latest", Options: opts},
-		{ImageName: "mcr.microsoft.com/mssql/server:2019-latest", Options: opts},
+		{ImageName: "mcr.microsoft.com/azure-sql-edge:latest", Options: sqlEdgeOpts},
+		{ImageName: "mcr.microsoft.com/mssql/server:2017-latest", Options: sqlServerOpts},
+		{ImageName: "mcr.microsoft.com/mssql/server:2019-latest", Options: sqlServerOpts},
 	}
 )
 
@@ -47,10 +63,11 @@ func msConnectionStringMsi(host, port string, useMsi bool) string {
 }
 
 func isReady(ctx context.Context, c dktest.ContainerInfo) bool {
-	ip, port, err := c.Port(defaultPort)
+	ip, _, err := c.Port(defaultPort)
 	if err != nil {
 		return false
 	}
+	port := strconv.Itoa(defaultPort)
 	uri := msConnectionString(ip, port)
 	db, err := sql.Open("sqlserver", uri)
 	if err != nil {
@@ -74,12 +91,21 @@ func isReady(ctx context.Context, c dktest.ContainerInfo) bool {
 	return true
 }
 
+func SkipIfUnsupportedArch(t *testing.T, c dktest.ContainerInfo) {
+	if strings.Contains(c.ImageName, "mssql") && !strings.HasPrefix(runtime.GOARCH, "amd") {
+		t.Skip(fmt.Sprintf("Image %s is not supported on arch %s", c.ImageName, runtime.GOARCH))
+	}
+}
+
 func Test(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.Port(defaultPort)
+		SkipIfUnsupportedArch(t, c)
+		ip, _, err := c.Port(defaultPort)
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		port := strconv.Itoa(defaultPort)
 
 		addr := msConnectionString(ip, port)
 		p := &SQLServer{}
@@ -100,10 +126,13 @@ func Test(t *testing.T) {
 
 func TestMigrate(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.Port(defaultPort)
+		SkipIfUnsupportedArch(t, c)
+		ip, _, err := c.Port(defaultPort)
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		port := strconv.Itoa(defaultPort)
 
 		addr := msConnectionString(ip, port)
 		p := &SQLServer{}
@@ -128,10 +157,13 @@ func TestMigrate(t *testing.T) {
 
 func TestMultiStatement(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
+		SkipIfUnsupportedArch(t, c)
+		ip, _, err := c.FirstPort()
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		port := strconv.Itoa(defaultPort)
 
 		addr := msConnectionString(ip, port)
 		ms := &SQLServer{}
@@ -159,14 +191,64 @@ func TestMultiStatement(t *testing.T) {
 	})
 }
 
-func TestErrorParsing(t *testing.T) {
+func TestBatchedStatement(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.FirstPort()
+		SkipIfUnsupportedArch(t, c)
+		ip, _, err := c.FirstPort()
 		if err != nil {
 			t.Fatal(err)
 		}
 
+		port := strconv.Itoa(defaultPort)
+
 		addr := msConnectionString(ip, port)
+		ms := &SQLServer{}
+		d, err := ms.Open(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := d.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		if err := d.Run(strings.NewReader(`CREATE PROCEDURE uspA
+AS
+BEGIN
+    SELECT 1;
+END;
+GO
+CREATE PROCEDURE uspB
+AS
+BEGIN
+    SELECT 2;
+END`)); err != nil {
+			t.Fatalf("expected err to be nil, got %v", err)
+		}
+
+		// make sure second proc exists
+		var exists int
+		if err := d.(*SQLServer).conn.QueryRowContext(context.Background(), "Select COUNT(1) from sysobjects where type = 'P' and category = 0 and [NAME] = 'uspB'").Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists != 1 {
+			t.Fatalf("expected proc uspB to exist")
+		}
+	})
+}
+
+func TestErrorParsing(t *testing.T) {
+	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
+		SkipIfUnsupportedArch(t, c)
+		ip, _, err := c.FirstPort()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		port := strconv.Itoa(defaultPort)
+
+		addr := msConnectionString(ip, port)
+
 		p := &SQLServer{}
 		d, err := p.Open(addr)
 		if err != nil {
@@ -191,10 +273,13 @@ func TestErrorParsing(t *testing.T) {
 
 func TestLockWorks(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		ip, port, err := c.Port(defaultPort)
+		SkipIfUnsupportedArch(t, c)
+		ip, _, err := c.Port(defaultPort)
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		port := strconv.Itoa(defaultPort)
 
 		addr := fmt.Sprintf("sqlserver://sa:%v@%v:%v?master", saPassword, ip, port)
 		p := &SQLServer{}
@@ -229,6 +314,7 @@ func TestLockWorks(t *testing.T) {
 
 func TestMsiTrue(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
+		SkipIfUnsupportedArch(t, c)
 		ip, port, err := c.Port(defaultPort)
 		if err != nil {
 			t.Fatal(err)
@@ -245,6 +331,7 @@ func TestMsiTrue(t *testing.T) {
 
 func TestOpenWithPasswordAndMSI(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
+		SkipIfUnsupportedArch(t, c)
 		ip, port, err := c.Port(defaultPort)
 		if err != nil {
 			t.Fatal(err)
@@ -276,6 +363,7 @@ func TestOpenWithPasswordAndMSI(t *testing.T) {
 
 func TestMsiFalse(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
+		SkipIfUnsupportedArch(t, c)
 		ip, port, err := c.Port(defaultPort)
 		if err != nil {
 			t.Fatal(err)
