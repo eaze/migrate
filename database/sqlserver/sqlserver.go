@@ -268,7 +268,15 @@ func (ss *SQLServer) SetVersion(version int, dirty bool) error {
 		return &database.Error{OrigErr: err, Err: "transaction start failed"}
 	}
 
-	query := `TRUNCATE TABLE "` + ss.config.MigrationsTable + `"`
+	query := `IF NOT EXISTS
+	(SELECT *
+		 FROM sysobjects
+		WHERE id = object_id(N'[dbo].[` + ss.config.MigrationsTable + `]')
+			AND OBJECTPROPERTY(id, N'IsUserTable') = 1
+	)
+	CREATE TABLE ` + ss.config.MigrationsTable + ` ( version BIGINT PRIMARY KEY NOT NULL, dirty BIT NOT NULL );
+	TRUNCATE TABLE "` + ss.config.MigrationsTable + `"`
+
 	if _, err := tx.Exec(query); err != nil {
 		if errRollback := tx.Rollback(); errRollback != nil {
 			err = multierror.Append(err, errRollback)
